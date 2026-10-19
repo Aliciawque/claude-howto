@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -467,6 +468,22 @@ class TestBuildWebsite:
         # Back-link to README rewrites to index.html
         assert "index.html" in example_html
 
+        # Diagrams render with the self-hosted Pele bundle, not Mermaid.js.
+        assert "vendor/pele/pele.global.js" in sc_html
+        assert "pele.mount(" in sc_html
+        assert "vendor/mermaid/" not in sc_html
+        # A diagram Pele rejects (reported on m.error, not thrown) gets its
+        # source back instead of a bare error message.
+        assert "m.error !== undefined" in sc_html
+        assert "container.replaceWith(pre)" in sc_html
+        # Zoom stays on, and zoom makes a shrunk diagram a tab stop: every
+        # <svg> Pele draws (it draws a new one on resize and font load) is
+        # named in onRender after the nearest heading.
+        assert "zoom: 'auto'" in sc_html
+        assert "onRender: nameDiagram" in sc_html
+        assert "svg.setAttribute('aria-label'" in sc_html
+        assert "svg.hasAttribute('aria-labelledby')" in sc_html
+
         # Stylesheet copied into assets
         assert (out_dir / "assets" / "site.css").exists()
         # Logo copied into assets
@@ -494,14 +511,33 @@ class TestVendorAssets:
 
         for attr in (
             "build_tailwind_css",
-            "fetch_mermaid",
+            "fetch_pele",
+            "ensure_pele_bundle",
             "fetch_fonts",
             "write_vendor_manifest",
             "ensure_tailwind_binary",
             "TAILWIND_VERSION",
-            "MERMAID_VERSION",
+            "PELE_VERSION",
         ):
             assert hasattr(vendor_assets, attr), f"missing {attr}"
+        for gone in ("fetch_mermaid", "MERMAID_VERSION", "MERMAID_URL"):
+            assert not hasattr(vendor_assets, gone), f"{gone} should be removed"
+
+    def test_pele_version_is_pinned_exactly(self) -> None:
+        """The Pele bundle is pinned to an exact X.Y.Z with a digest per file."""
+        import re
+
+        import vendor_assets
+
+        assert re.fullmatch(r"\d+\.\d+\.\d+", vendor_assets.PELE_VERSION)
+        assert f"pele@{vendor_assets.PELE_VERSION}" in vendor_assets.PELE_BASE_URL
+        assert set(vendor_assets.PELE_FILES) == {
+            "dist/pele.js",
+            "dist/pele.global.js",
+            "LICENSE",
+        }
+        for digest in vendor_assets.PELE_FILES.values():
+            assert re.fullmatch(r"[0-9a-f]{64}", digest)
 
     def test_detect_tailwind_asset_name(self) -> None:
         """Platform detection returns one of the known asset names."""
@@ -559,6 +595,220 @@ class TestVendorAssets:
 
         assert keys[0] != keys[1]
         assert downloads == urls
+
+
+# =============================================================================
+# Pele bundle: pinned, sha256-verified on every use
+# =============================================================================
+
+
+_FAKE_PELE = {
+    "dist/pele.js": b"export function render() {}\n",
+    "dist/pele.global.js": b"var pele = (() => ({}))();\n",
+    "LICENSE": b"MIT License\n",
+}
+
+
+class TestPeleBundle:
+    @pytest.fixture
+    def fake_pele(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[Path, list[str], dict[str, bytes]]:
+        """Point the vendor cache at tmp_path and serve fake bundle bytes."""
+        import vendor_assets
+
+        cache_root = tmp_path / "vendor-cache"
+        monkeypatch.setattr(vendor_assets, "_vendor_cache_dir", lambda: cache_root)
+        monkeypatch.setattr(
+            vendor_assets,
+            "PELE_FILES",
+            {rel: hashlib.sha256(data).hexdigest() for rel, data in _FAKE_PELE.items()},
+        )
+        served = dict(_FAKE_PELE)
+        downloads: list[str] = []
+
+        def fake_download(
+            url: str, dest: Path, headers: dict[str, str] | None = None
+        ) -> None:
+            del headers
+            rel = url.removeprefix(vendor_assets.PELE_BASE_URL + "/")
+            downloads.append(rel)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(served[rel])
+
+        monkeypatch.setattr(vendor_assets, "_download", fake_download)
+        cache = cache_root / "pele" / vendor_assets.PELE_VERSION
+        return cache, downloads, served
+
+    def test_good_bytes_cached_and_not_redownloaded(
+        self,
+        fake_pele: tuple[Path, list[str], dict[str, bytes]],
+        logger: logging.Logger,
+    ) -> None:
+        import vendor_assets
+
+        cache, downloads, _ = fake_pele
+        assert vendor_assets.ensure_pele_bundle(logger) == cache
+        assert sorted(downloads) == sorted(_FAKE_PELE)
+        assert (cache / "pele.mjs").read_bytes() == _FAKE_PELE["dist/pele.js"]
+        assert (cache / "LICENSE").read_bytes() == _FAKE_PELE["LICENSE"]
+
+        downloads.clear()
+        vendor_assets.ensure_pele_bundle(logger)
+        assert downloads == [], "verified cache must not be downloaded again"
+
+    def test_corrupted_cache_is_redownloaded(
+        self,
+        fake_pele: tuple[Path, list[str], dict[str, bytes]],
+        logger: logging.Logger,
+    ) -> None:
+        import vendor_assets
+
+        cache, downloads, _ = fake_pele
+        vendor_assets.ensure_pele_bundle(logger)
+        (cache / "pele.mjs").write_bytes(b"tampered")
+        downloads.clear()
+
+        vendor_assets.ensure_pele_bundle(logger)
+
+        assert downloads == ["dist/pele.js"]
+        assert (cache / "pele.mjs").read_bytes() == _FAKE_PELE["dist/pele.js"]
+
+    def test_esm_bundle_is_cached_under_an_mjs_name(
+        self,
+        fake_pele: tuple[Path, list[str], dict[str, bytes]],
+        logger: logging.Logger,
+    ) -> None:
+        # Node.js 20.0-20.18 and 22.0-22.6 load a bare .js file with no
+        # "type": "module" beside it as CommonJS and fail on `export`.
+        import vendor_assets
+
+        cache, downloads, _ = fake_pele
+        cache.mkdir(parents=True)
+        # A cache written before the rename holds only pele.js.
+        (cache / "pele.js").write_bytes(_FAKE_PELE["dist/pele.js"])
+
+        vendor_assets.ensure_pele_bundle(logger)
+
+        assert vendor_assets.PELE_ESM_BUNDLE == "pele.mjs"
+        assert "dist/pele.js" in downloads
+        assert (cache / "pele.mjs").read_bytes() == _FAKE_PELE["dist/pele.js"]
+
+    def test_mismatching_download_raises_and_leaves_no_file(
+        self,
+        fake_pele: tuple[Path, list[str], dict[str, bytes]],
+        logger: logging.Logger,
+    ) -> None:
+        import vendor_assets
+
+        cache, _, served = fake_pele
+        served["dist/pele.global.js"] = b"not the pinned bundle"
+
+        with pytest.raises(RuntimeError, match="Checksum mismatch"):
+            vendor_assets.ensure_pele_bundle(logger)
+
+        assert not (cache / "pele.global.js").exists()
+        assert not (cache / "pele.global.js.part").exists()
+
+    def test_fetch_pele_copies_bundle_and_license(
+        self,
+        fake_pele: tuple[Path, list[str], dict[str, bytes]],
+        tmp_path: Path,
+        logger: logging.Logger,
+    ) -> None:
+        import vendor_assets
+
+        target = tmp_path / "site" / "assets" / "vendor" / "pele"
+        script = vendor_assets.fetch_pele(target, logger)
+
+        assert script == target / "pele.global.js"
+        assert script.read_bytes() == _FAKE_PELE["dist/pele.global.js"]
+        assert (target / "LICENSE").read_bytes() == _FAKE_PELE["LICENSE"]
+
+    def test_manifest_records_pele_not_mermaid(self, tmp_path: Path) -> None:
+        import vendor_assets
+
+        vendor_assets.write_vendor_manifest(tmp_path, fonts_count=3)
+        manifest = json.loads((tmp_path / "manifest.json").read_text("utf-8"))
+        assert manifest["pele"] == vendor_assets.PELE_VERSION
+        assert "mermaid" not in manifest
+
+
+# =============================================================================
+# Diagram styles (site.css)
+# =============================================================================
+
+SITE_CSS = Path(__file__).parent.parent / "website_templates" / "site.css"
+# Light fills that site lessons set on nodes without a text colour.
+SOURCE_NODE_FILLS = ("#e1f5ff", "#e1f5fe", "#fff9c4")
+
+
+def _css_rule(css: str, selector: str) -> str:
+    match = re.search(rf"^{re.escape(selector)}\s*\{{(.*?)\}}", css, re.M | re.S)
+    assert match, f"no rule for {selector!r} in site.css"
+    return match.group(1)
+
+
+def _css_color(rule: str, prop: str) -> str:
+    match = re.search(rf"(?<![\w-]){re.escape(prop)}:\s*(#[0-9a-fA-F]{{6}})", rule)
+    assert match, f"no {prop} colour in rule"
+    return match.group(1)
+
+
+def _contrast(first: str, second: str) -> float:
+    def luminance(color: str) -> float:
+        channels = [int(color[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+        r, g, b = (
+            c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+            for c in channels
+        )
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    high, low = sorted((luminance(first), luminance(second)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+class TestDiagramStyles:
+    @pytest.mark.parametrize("selector", [".mermaid", ".dark .mermaid"])
+    def test_border_has_3_to_1_contrast(self, selector: str) -> None:
+        # --pele-bg mirrors the page background (bg-slate-50 / bg-slate-950).
+        rule = _css_rule(SITE_CSS.read_text("utf-8"), selector)
+        border = _css_color(rule, "--pele-border")
+        for surface in ("--pele-bg", "--pele-surface", "--pele-surface-alt"):
+            assert _contrast(border, _css_color(rule, surface)) >= 3, surface
+
+    def test_layout_rules_leave_the_source_fallback_alone(self) -> None:
+        css = SITE_CSS.read_text("utf-8")
+        assert "background" not in _css_rule(css, ".mermaid")
+        assert "background: transparent" in _css_rule(css, "div.mermaid")
+
+    def test_diagram_starts_below_the_zoom_buttons(self) -> None:
+        # Pele 1.6.0 draws its zoom box 8px below the top of a diagram it
+        # shrank to fit (two 24px buttons, 2px gap, 2px padding, 1px border:
+        # 56px tall) and sets [hidden] on it when the diagram fits.
+        rule = _css_rule(
+            SITE_CSS.read_text("utf-8"),
+            "div.mermaid:has(> .pele-zoom:not([hidden]))",
+        )
+        match = re.search(r"padding-top:\s*([^;]+);", rule)
+        assert match, "no padding-top in the zoom-box rule"
+        value = match.group(1)
+        room = sum(float(n) for n in re.findall(r"([\d.]+)px", value))
+        room += 16 * sum(float(n) for n in re.findall(r"([\d.]+)rem", value))
+        assert room > 8 + 56
+        # Side padding would narrow the width Pele lays the diagram out to.
+        assert "padding-right" not in rule
+        assert "padding-left" not in rule
+
+    def test_dark_labels_on_source_fills_are_readable(self) -> None:
+        rule = _css_rule(
+            SITE_CSS.read_text("utf-8"),
+            '.dark .mermaid .pele-node:has(> [style*="fill:"]) '
+            '> .pele-label:not([style*="fill:"])',
+        )
+        label = _css_color(rule, "fill")
+        for fill in SOURCE_NODE_FILLS:
+            assert _contrast(label, fill) >= 4.5, fill
 
 
 # =============================================================================
