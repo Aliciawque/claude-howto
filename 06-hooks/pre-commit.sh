@@ -8,6 +8,13 @@
 # Any other non-zero value is a NON-blocking error — the commit would proceed.
 # Source: https://code.claude.com/docs/en/hooks
 
+# Read the hook JSON from stdin; only run the tests for git commit commands
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+if ! echo "$COMMAND" | grep -q 'git commit'; then
+  exit 0
+fi
+
 echo "🧪 Running tests before commit..."
 
 # Check if package.json exists (Node.js project)
